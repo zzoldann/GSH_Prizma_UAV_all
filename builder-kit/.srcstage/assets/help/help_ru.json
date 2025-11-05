@@ -1,0 +1,46 @@
+{
+  "x_axis_mode": {
+    "label": "Шкала оси X",
+    "tooltip": "Режим отображения оси X на графике.",
+    "whats_this": "Выберите масштаб и формат подписи делений."
+  },
+  "x_axis_mode_options": [
+    {
+      "label": "Линейная",
+      "key": "linear"
+    },
+    {
+      "label": "Логарифмическая",
+      "key": "log"
+    },
+    {
+      "label": "Линейная (без 1eN)",
+      "key": "linear_plain"
+    }
+  ],
+  "atten_model": {
+    "label": "Модель затуханий",
+    "tooltip": "FSPL/Окумура/ITU/Two-Ray.",
+    "whats_this": "Выбор формул потерь"
+  },
+  "terrain_morphology": {
+    "label": "Морфология профиля",
+    "tooltip": "Рельеф/подстилающая.",
+    "whats_this": "Равнина/холмы/горы"
+  },
+  "earth_curvature": {
+    "label": "Учёт кривизны",
+    "tooltip": "Включить кривизну+рефракцию",
+    "whats_this": "k-factor; дальние трассы"
+  },
+  "k_factor": {
+    "label": "K-фактор",
+    "tooltip": "Эфф. радиус Земли",
+    "whats_this": "Типично 4/3"
+  },
+  "env": {
+    "label": "Местность",
+    "tooltip": "Окружение",
+    "whats_this": "Город/Пригород/Село/Равнина/Лес/Водоём/Река"
+  }
+}

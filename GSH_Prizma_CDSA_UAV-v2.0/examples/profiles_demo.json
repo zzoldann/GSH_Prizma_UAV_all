@@ -1,0 +1,14 @@
+{
+  "modems": [
+    { "name": "SX1276 LoRa 868 MHz @125 kHz (SF7)" },
+    { "name": "SX1276 LoRa 868 MHz @125 kHz (SF12)" },
+    { "name": "SX1276 LoRa 433 MHz @125 kHz (SF7)" },
+    { "name": "Generic FSK 2.4 GHz (2 Mbps)" }
+  ],
+  "antennas": [
+    { "name": "Четвертьволновой штырь 2 dBi" },
+    { "name": "Патч 6 dBi (плоский монтаж)" },
+    { "name": "Яги ~9 dBi (наземная)" },
+    { "name": "Спираль RHCP ~8 dBi (UAV)" }
+  ]
+}

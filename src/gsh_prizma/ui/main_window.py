@@ -1,0 +1,82 @@
+from PySide6 import QtWidgets, QtCore
+from .tab_link import LinkBudgetTab
+
+class MainWindow(QtWidgets.QMainWindow):
+    def showEvent(self, e):
+        super().showEvent(e)
+        if not getattr(self, "_resized_once", False):
+            try:
+                _sz = self.sizeHint()
+            except Exception:
+                _sz = self.size()
+            self.resize(int(_sz.width()*1.3), int(_sz.height()*1.3))
+            self._resized_once = True
+    def __init__(self):
+        self._resized_once = False
+        super().__init__()
+        self.setWindowTitle("GSH Prizma Gen3 CDSA UAV v1.2.3")
+
+        central = QtWidgets.QWidget()
+        h = QtWidgets.QHBoxLayout(central)
+
+        # Tabs (левая часть)
+        self.tabs = QtWidgets.QTabWidget()
+        self.tab_link = LinkBudgetTab(self)
+        self.tabs.addTab(self.tab_link, "Линк-бюджет / Дальность")
+
+        # Правая колонка с кнопками
+        side_layout = QtWidgets.QVBoxLayout()
+        side_layout.setAlignment(QtCore.Qt.AlignTop)
+
+        # Отчёты (только справа)
+        self.btn_report_html = QtWidgets.QPushButton("Отчёт HTML")
+        self.btn_report_pdf  = QtWidgets.QPushButton("Отчёт PDF")
+        self.btn_report_html.clicked.connect(self.tab_link.export_html_dialog)
+        self.btn_report_pdf.clicked.connect(self.tab_link.export_pdf_dialog)
+
+        # Проект
+        self.btn_save = QtWidgets.QPushButton("Сохранить проект")
+        self.btn_open = QtWidgets.QPushButton("Открыть проект")
+        self.btn_save.clicked.connect(self.do_save)
+        self.btn_open.clicked.connect(self.do_open)
+
+        # Порядок: отчёты сверху, потом проект
+        side_layout.addWidget(self.btn_report_html)
+        side_layout.addWidget(self.btn_report_pdf)
+        side_layout.addSpacing(8)
+        side_layout.addWidget(self.btn_save)
+        side_layout.addWidget(self.btn_open)
+        # Одна ширина по самому широкому
+        _buttons = [self.btn_report_html, self.btn_report_pdf, self.btn_save, self.btn_open]
+        _maxw = max(b.sizeHint().width() for b in _buttons)
+        for b in _buttons:
+            b.setFixedWidth(_maxw)
+        side_layout.addStretch(1)
+
+        # Ширина кнопок: +20%
+        # Упаковываем правую колонку в виджет-контейнер
+        side_widget = QtWidgets.QWidget()
+        side_widget.setLayout(side_layout)
+
+        h.addWidget(self.tabs, 1)
+        h.addWidget(side_widget, 0)
+
+        self.setCentralWidget(central)
+
+        # resize_from_hint_13x: увеличить окно ~на 30% от sizeHint()
+        try:
+            _sz = self.sizeHint()
+            self.resize(int(_sz.width()*1.3), int(_sz.height()*1.3))
+        except Exception:
+            pass
+    def do_save(self):
+        fn = QtWidgets.QFileDialog.getSaveFileName(self, "Сохранить проект", "project.json", "JSON (*.json)")[0]
+        if not fn:
+            return
+        self.tab_link.save_project_to_file(fn)
+    def do_open(self):
+        fn = QtWidgets.QFileDialog.getOpenFileName(self, "Открыть проект", "", "JSON (*.json)")[0]
+        if not fn:
+            return
+        self.tab_link.load_project_from_file(fn)
+        QtWidgets.QMessageBox.information(self, "Открыто", "Проект загружен.")

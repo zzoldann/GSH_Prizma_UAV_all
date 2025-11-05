@@ -1,0 +1,13 @@
+import argparse
+
+def main(argv=None):
+    parser = argparse.ArgumentParser(prog="prizma-cdsa")
+    sub = parser.add_subparsers(dest="cmd", required=True)
+    sub.add_parser("gui", help="Запустить графический интерфейс")
+    args = parser.parse_args(argv)
+    if args.cmd == "gui":
+        from gsh_prizma.ui.app import main as run_gui
+        return run_gui()
+
+if __name__ == "__main__":
+    raise SystemExit(main())

@@ -1,0 +1,90 @@
+from PySide6 import QtWidgets, QtCore
+from .i18n import STR
+from .tab_link import LinkBudgetTab
+from .tab_antenna import AntennaWizardTab
+from ..io.project_schema import Project, save_project, load_project
+
+class MainWindow(QtWidgets.QMainWindow):
+    def __init__(self, lang="ru"):
+        super().__init__()
+        S = STR[lang]
+        self.setWindowTitle("GSH Prizma Gen3 CDSA UAV")
+
+        self.tabs = QtWidgets.QTabWidget()
+        self.link_tab = LinkBudgetTab(lang=lang)
+        self.ant_tab = AntennaWizardTab(lang=lang)
+
+        self.tabs.addTab(self.link_tab, S["tab_link"])
+        self.tabs.addTab(self.ant_tab, S["tab_ant"])
+
+        central = QtWidgets.QWidget()
+        h = QtWidgets.QHBoxLayout(central)
+        h.addWidget(self.tabs, 3)
+
+        side = QtWidgets.QVBoxLayout()
+        self.btn_save = QtWidgets.QPushButton(S["btn_save"])
+        self.btn_open = QtWidgets.QPushButton(S["btn_open"])
+        
+        # -- inserted by patch: report buttons placed above Save/Open --
+        self.btn_report_html = QtWidgets.QPushButton("Отчёт HTML")
+        self.btn_report_pdf  = QtWidgets.QPushButton("Отчёт PDF")
+
+        try:
+            self.btn_report_html.clicked.connect(lambda: self.tab_link.export_html_dialog())
+            self.btn_report_pdf.clicked.connect(lambda: self.tab_link.export_pdf_dialog())
+        except Exception:
+            try:
+                _w = getattr(self, "tab_link", None) or getattr(self, "link_tab", None)
+                if _w is not None:
+                    self.btn_report_html.clicked.connect(_w.export_html_dialog)
+                    self.btn_report_pdf.clicked.connect(_w.export_pdf_dialog)
+            except Exception:
+                pass
+
+        # Кнопки проекта
+        side.addWidget(self.btn_save)
+        side.addWidget(self.btn_open)
+
+        # Кнопки отчёта выше Save/Open
+        self.btn_report_html = QtWidgets.QPushButton("Отчёт HTML")
+        self.btn_report_pdf  = QtWidgets.QPushButton("Отчёт PDF")
+
+        try:
+            self.btn_report_html.clicked.connect(self.tab_link.export_html_dialog)
+            self.btn_report_pdf.clicked.connect(self.tab_link.export_pdf_dialog)
+        except Exception:
+            try:
+                _w = getattr(self, "tab_link", None) or getattr(self, "link_tab", None)
+                if _w is not None:
+                    self.btn_report_html.clicked.connect(_w.export_html_dialog)
+                    self.btn_report_pdf.clicked.connect(_w.export_pdf_dialog)
+            except Exception:
+                pass
+
+        # Вставляем отчёты прямо перед Save
+        side.insertWidget(side.indexOf(self.btn_save), self.btn_report_pdf)
+        side.insertWidget(side.indexOf(self.btn_save), self.btn_report_html)
+
+        # Уменьшаем ширину всех четырёх кнопок примерно в 3 раза
+        for _b in (self.btn_report_html, self.btn_report_pdf, self.btn_save, self.btn_open):
+            try:
+                _b.setFixedWidth(max(90, _b.sizeHint().width() // 3))
+            except Exception:
+                pass
+        h.addLayout(side, 1)
+        self.setCentralWidget(central)
+
+        self.btn_save.clicked.connect(self.do_save)
+        self.btn_open.clicked.connect(self.do_open)
+
+    def do_save(self):
+        fn = QtWidgets.QFileDialog.getSaveFileName(self, "Сохранить проект", "project.json", "JSON (*.json)")[0]
+        if not fn: return
+        prj = Project(schema="1.0", name="Untitled", link={}, antenna={})
+        save_project(prj, fn)
+
+    def do_open(self):
+        fn = QtWidgets.QFileDialog.getOpenFileName(self, "Открыть проект", "", "JSON (*.json)")[0]
+        if not fn: return
+        _ = load_project(fn)
+        QtWidgets.QMessageBox.information(self, "Открыто", "Проект загружен.")

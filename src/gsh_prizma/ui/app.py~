@@ -1,0 +1,9 @@
+from PySide6 import QtWidgets
+from .main_window import MainWindow
+
+def main():
+    app = QtWidgets.QApplication.instance() or QtWidgets.QApplication([])
+    w = MainWindow()
+    w.setFixedSize(1400, 870)  # фиксируем ширину и высоту
+    w.show()
+    return app.exec()

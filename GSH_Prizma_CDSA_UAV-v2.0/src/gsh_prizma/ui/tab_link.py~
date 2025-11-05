@@ -1,0 +1,910 @@
+from PySide6 import QtWidgets, QtCore, QtGui
+from PySide6.QtPrintSupport import QPrinter
+from matplotlib.backends.backend_qt5agg import FigureCanvasQTAgg as FigureCanvas
+from matplotlib.figure import Figure
+from matplotlib.ticker import FuncFormatter, LogLocator
+from math import log10, sqrt
+import json, os
+
+ORG = "GSH"
+APP = "PrizmaGen3"
+
+def noise_floor_dBm(B_hz: float) -> float:
+    if B_hz <= 0: B_hz = 1.0
+    return -174.0 + 10.0 * log10(B_hz)
+
+def a_hm_hata(f_MHz: float, h_m: float, city_size: str) -> float:
+    f = max(f_MHz, 1.0); hm = max(h_m, 0.1)
+    if city_size == "Крупная":
+        return 8.29 * (log10(1.54 * hm))**2 - 1.1 if f <= 300.0 else 3.2 * (log10(11.75 * hm))**2 - 4.97
+    return (1.1 * log10(f) - 0.7) * hm - (1.56 * log10(f) - 0.8)
+
+def hata_urban_L(f_MHz: float, h_b: float, h_m: float, d_km: float, city_size: str) -> float:
+    f = max(f_MHz, 1.0); hb = max(h_b, 0.1); d = max(d_km, 1e-6)
+    a = a_hm_hata(f, h_m, city_size)
+    return 69.55 + 26.16*log10(f) - 13.82*log10(hb) - a + (44.9 - 6.55*log10(hb))*log10(d)
+
+def hata_env_correction(L_urban: float, f_MHz: float, env_corr: str) -> float:
+    f = max(f_MHz, 1.0)
+    if env_corr == "Пригород": return L_urban - 2*(log10(f/28.0))**2 - 5.4
+    if env_corr == "Открытая": return L_urban - 4.78*(log10(f))**2 + 18.33*log10(f) - 40.94
+    return L_urban
+
+def cost231_hata_L(f_MHz: float, h_b: float, h_m: float, d_km: float, city_size: str, metropolis: bool) -> float:
+    f = max(f_MHz, 1.0); hb = max(h_b, 0.1); d = max(d_km, 1e-6)
+    a = a_hm_hata(f, h_m, "Крупная" if metropolis or city_size == "Крупная" else "Малая")
+    C_m = 3.0 if metropolis else 0.0
+    return 46.3 + 33.9*log10(f) - 13.82*log10(hb) - a + (44.9 - 6.55*log10(hb))*log10(d) + C_m
+
+def invert_A_B(Lmax: float, A: float, B: float) -> float:
+    if B <= 0: return 0.0
+    return 10.0 ** ((Lmax - A) / B)
+
+def radio_horizon_km(h_tx_m: float, h_rx_m: float) -> float:
+    return 3.57 * (sqrt(max(h_tx_m, 0.0)) + sqrt(max(h_rx_m, 0.0)))
+
+def fmt_plain(x, pos):
+    if x >= 100: return f"{int(round(x))}"
+    if x >= 10:  return f"{x:.0f}"
+    if x >= 1:   s = f"{x:.1f}"
+    else:        s = f"{x:.2f}"
+    return s.rstrip('0').rstrip('.')
+
+class LinkBudgetTab(QtWidgets.QWidget):
+    def __init__(self, parent=None):
+        QtCore.QTimer.singleShot(0, self._apply_width_policy)
+        super().__init__(parent)
+        root = QtWidgets.QHBoxLayout(self)
+
+        # ---------- ЛЕВО ----------
+        left = QtWidgets.QScrollArea(self); left.setWidgetResizable(True)
+        self.form_host = QtWidgets.QWidget()
+        form = QtWidgets.QFormLayout(self.form_host)
+        form.setLabelAlignment(QtCore.Qt.AlignRight)
+
+        # Профили
+        self.cb_profile = QtWidgets.QComboBox(); self._init_empty_cb(self.cb_profile, "— профиль не задан —")
+        self.cb_ant_tx  = QtWidgets.QComboBox(); self._init_empty_cb(self.cb_ant_tx,  "— антенна TX не задана —")
+        self.cb_ant_rx  = QtWidgets.QComboBox(); self._init_empty_cb(self.cb_ant_rx,  "— антенна RX не задана —")
+        self.btn_load_profiles = QtWidgets.QPushButton("Загрузить профили…")
+        self.btn_load_profiles.clicked.connect(self.on_load_profiles_clicked)
+
+        form.addRow("Модем", self.cb_profile)  # <— имя поля
+        form.addRow("Антенна TX", self.cb_ant_tx)
+        form.addRow("Антенна RX", self.cb_ant_rx)
+        form.addRow(self.btn_load_profiles)
+
+        # Среда / Рельеф
+        form.addRow(QtWidgets.QLabel("<b>Среда / Рельеф</b>"))
+        self.cb_env_main = QtWidgets.QComboBox(); self.cb_env_main.addItems(["Город", "Сельская"])
+        self.cb_env_type = QtWidgets.QComboBox(); self._update_env_type()
+        self.cb_env_main.currentIndexChanged.connect(self._update_env_type)
+        form.addRow("Среда", self.cb_env_main)
+        form.addRow("Тип",   self.cb_env_type)
+
+        # Линк-бюджет
+        form.addRow(QtWidgets.QLabel("<b>Линк-бюджет</b>"))
+        self.sp_p_tx   = self._dspin(-30, 40, 0.1, 14.0, suffix=" dBm")
+        self.sp_g_tx   = self._dspin(-10, 30, 0.1, 2.0,  suffix=" dBi")
+        self.sp_g_rx   = self._dspin(-10, 30, 0.1, 2.0,  suffix=" dBi")
+        self.sp_l_sys  = self._dspin(0, 50, 0.1, 2.0,   suffix=" dB")
+        self.sp_nf     = self._dspin(0, 20, 0.1, 4.0,   suffix=" dB")
+        self.sp_bw_khz = self._dspin(0.1, 50000, 0.1, 125.0, suffix=" kHz")
+        self.sp_snrreq = self._dspin(-10, 30, 0.1, 7.0, suffix=" dB")
+        self.sp_lbf    = self._dspin(0, 40, 0.1, 12.0,  suffix=" dB")
+        form.addRow("P_tx", self.sp_p_tx);   form.addRow("G_tx", self.sp_g_tx)
+        form.addRow("G_rx", self.sp_g_rx);   form.addRow("L_sys", self.sp_l_sys)
+        form.addRow("NF", self.sp_nf);       form.addRow("Полоса B", self.sp_bw_khz)
+        form.addRow("Треб. SNR", self.sp_snrreq); form.addRow("Запас Lbf", self.sp_lbf)
+
+        # Модель/геометрия
+        form.addRow(QtWidgets.QLabel("<b>Модель и геометрия</b>"))
+        self.cb_model  = QtWidgets.QComboBox(); self.cb_model.addItems(["Hata", "COST-231 Hata"])
+        self.sp_f_MHz  = self._dspin(30, 6000, 0.1, 868.0, suffix=" MHz")
+        self.sp_h_tx   = self._dspin(0.1, 12000, 0.1, 5.0, suffix=" m")
+        self.sp_h_rx   = self._dspin(0.1, 12000, 0.1, 1.5, suffix=" m")
+        form.addRow("Модель", self.cb_model)
+        form.addRow("f (МГц)", self.sp_f_MHz)
+        form.addRow("h_TX (м)", self.sp_h_tx)
+        form.addRow("h_RX (м)", self.sp_h_rx)
+
+        # Результаты
+        self.lbl_Lmax   = QtWidgets.QLabel("—")
+        self.lbl_dlink  = QtWidgets.QLabel("—")
+        self.lbl_dhor   = QtWidgets.QLabel("—")
+        self.lbl_dtheor = QtWidgets.QLabel("—")
+        grid_res = QtWidgets.QGridLayout()
+        grid_res.addWidget(QtWidgets.QLabel("<b>L_max (допустимые потери)</b>"), 0,0); grid_res.addWidget(self.lbl_Lmax,  0,1)
+        grid_res.addWidget(QtWidgets.QLabel("<b>d_link (по модели)</b>"),        1,0); grid_res.addWidget(self.lbl_dlink, 1,1)
+        grid_res.addWidget(QtWidgets.QLabel("<b>d_horizon (радиогоризонт)</b>"), 2,0); grid_res.addWidget(self.lbl_dhor,  2,1)
+        grid_res.addWidget(QtWidgets.QLabel("<b>Теоретическая дальность</b>"),   3,0); grid_res.addWidget(self.lbl_dtheor,3,1)
+        form.addRow(QtWidgets.QLabel("<b>Результаты</b>")); form.addRow(grid_res)
+
+        # Переключатель лог-оси X — в отдельной «строке» со сдвигом влево
+        self.chk_logx = QtWidgets.QCheckBox("Логарифмическая ось X")
+        self.chk_logx.setChecked(True)
+        self.chk_logx.toggled.connect(self.recompute)
+        self._logx_row = QtWidgets.QWidget()
+        self._logx_lay = QtWidgets.QHBoxLayout(self._logx_row); self._logx_lay.setContentsMargins(0,0,0,0)
+        self._logx_lay.addWidget(self.chk_logx, 0, QtCore.Qt.AlignLeft)
+        form.addRow("", self._logx_row)
+        # ## logx_shift_10pct
+        QtCore.QTimer.singleShot(0, self._update_logx_offset)
+        QtCore.QTimer.singleShot(0, self._update_logx_offset)
+
+        # Ширины: три верхних комбобокса выравниваем и +30%; остальные +25%
+        # top3 = [self.cb_profile, self.cb_ant_tx, self.cb_ant_rx]
+        top3 = [self.cb_ant_tx, self.cb_ant_rx]
+        maxw = max(w.sizeHint().width() for w in top3)
+        for w in top3:
+            w.setMinimumWidth(int(maxw * 1.50))
+            w.setMaximumWidth(int(maxw * 1.60))
+        others = [
+            self.cb_env_main, self.cb_env_type, self.sp_p_tx, self.sp_g_tx, self.sp_g_rx,
+            self.sp_l_sys, self.sp_nf, self.sp_bw_khz, self.sp_snrreq, self.sp_lbf,
+            self.cb_model, self.sp_f_MHz, self.sp_h_tx, self.sp_h_rx
+        ]
+        for w in others:
+            try:
+                w.setMinimumWidth(int(w.sizeHint().width() * 1.25))
+                w.setMaximumWidth(int(w.sizeHint().width() * 1.25))
+            except Exception:
+                pass
+
+        left.setWidget(self.form_host)
+        root.addWidget(left, 0)
+
+        # ---------- ПРАВО: график ----------
+        fig = Figure(figsize=(6,4))
+        self.canvas = FigureCanvas(fig)
+        self.ax = fig.add_subplot(111)
+        root.addWidget(self.canvas, 1)
+
+        # Сигналы → пересчёт
+        for w in (self.sp_p_tx, self.sp_g_tx, self.sp_g_rx, self.sp_l_sys, self.sp_nf,
+                  self.sp_bw_khz, self.sp_snrreq, self.sp_lbf, self.sp_f_MHz, self.sp_h_tx, self.sp_h_rx):
+            w.valueChanged.connect(self.recompute)
+        for w in (self.cb_model, self.cb_env_main, self.cb_env_type):
+            w.currentIndexChanged.connect(self.recompute)
+
+        # Восстановить последний профиль при старте (если есть)
+        QtCore.QTimer.singleShot(0, self._restore_last_profiles)
+
+        self._last_calc = {}
+        
+        # ## width_top3_plus_30    self.cb_profile, 
+        try:
+            _top3 = [self.cb_ant_tx, self.cb_ant_rx]
+            _maxw = max(w.sizeHint().width() for w in _top3)
+            for _w in _top3:
+                _w.setMinimumWidth(int(_maxw * 1.30))
+                _w.setMaximumWidth(int(_maxw * 1.30))
+        except Exception:
+            pass
+        # ## width_others_plus_25
+        try:
+            _others = []
+            for name, val in vars(self).items():
+                if name.startswith(("sp_", "cb_")) and val not in (self.cb_profile, self.cb_ant_tx, self.cb_ant_rx):
+                    _others.append(val)
+            for _w in _others:
+                if hasattr(_w, "sizeHint"):
+                    _wh = _w.sizeHint().width()
+                    _w.setMinimumWidth(int(_wh * 1.25))
+                    _w.setMaximumWidth(int(_wh * 1.25))
+        except Exception:
+            pass
+    
+        self.recompute()
+        QtCore.QTimer.singleShot(0, self._restore_last_profiles)
+
+
+    # ## last_profiles_settings
+    def _settings(self):
+        st = QtCore.QSettings("GSH", "PrizmaGen3")
+        st.setFallbacksEnabled(True)
+        return st
+
+    def _save_last_profiles(self):
+        st = self._settings()
+        try:
+            st.setValue("last_modem_text", self.cb_profile.currentText())
+            st.setValue("last_ant_tx_text", self.cb_ant_tx.currentText())
+            st.setValue("last_ant_rx_text", self.cb_ant_rx.currentText())
+        except Exception:
+            pass
+
+    def _restore_last_profiles(self):
+        st = self._settings()
+        fn = st.value("last_profiles_file", "", str)
+        if fn:
+            try:
+                import json, os
+                if os.path.exists(fn):
+                    with open(fn, "r", encoding="utf-8") as f:
+                        data = json.load(f)
+                    modems = [m.get("name","").strip() for m in data.get("modems", []) if m.get("name")]
+                    ants   = [a.get("name","").strip() for a in data.get("antennas", []) if a.get("name")]
+                    if modems:
+                        self.cb_profile.clear(); self.cb_profile.addItems(modems)
+                    if ants:
+                        self.cb_ant_tx.clear(); self.cb_ant_tx.addItems(ants)
+                        self.cb_ant_rx.clear(); self.cb_ant_rx.addItems(ants)
+            except Exception:
+                pass
+        try:
+            self.cb_profile.setEditable(True); self.cb_profile.setEditText(st.value("last_modem_text","",str))
+            self.cb_ant_tx.setEditable(True);  self.cb_ant_tx.setEditText(st.value("last_ant_tx_text","",str))
+            self.cb_ant_rx.setEditable(True);  self.cb_ant_rx.setEditText(st.value("last_ant_rx_text","",str))
+            self.cb_profile.currentTextChanged.connect(self._save_last_profiles)
+            self.cb_ant_tx.currentTextChanged.connect(self._save_last_profiles)
+            self.cb_ant_rx.currentTextChanged.connect(self._save_last_profiles)
+        except Exception:
+            pass
+    # ---------- helpers ----------
+    def _dspin(self, lo, hi, step, val, suffix=""):
+        sp = QtWidgets.QDoubleSpinBox()
+        sp.setRange(lo, hi); sp.setSingleStep(step); sp.setDecimals(3 if step < 1 else 1)
+        if suffix: sp.setSuffix(suffix)
+        sp.setValue(val); sp.setKeyboardTracking(False)
+        return sp
+
+    def _init_empty_cb(self, cb: QtWidgets.QComboBox, ph: str):
+        cb.clear()
+        if hasattr(cb, "setPlaceholderText"): cb.setPlaceholderText(ph)
+        cb.setEditable(True); cb.setEditText("")
+
+    def _update_env_type(self):
+        main = self.cb_env_main.currentText() if hasattr(self, "cb_env_main") else "Город"
+        self.cb_env_type.blockSignals(True); self.cb_env_type.clear()
+        if main == "Город":
+            self.cb_env_type.addItems(["Метрополис", "Большой", "Средний", "Малый"])
+        else:
+            self.cb_env_type.addItems(["Гор. типа", "Село", "Деревня"])
+        self.cb_env_type.blockSignals(False)
+
+    def _update_logx_offset(self):
+        # сдвиг влево ≈10% ширины блока форм
+        w = max(0, int(self.form_host.width() * 0.10))
+        self._logx_lay.setContentsMargins(max(0, w), 0, 0, 0)
+
+    def resizeEvent(self, e):
+        super().resizeEvent(e)
+        self._update_logx_offset()
+
+    # ---------- расчёт/график ----------
+    def recompute(self):
+        B_hz = self.sp_bw_khz.value() * 1e3
+        N_dBm = noise_floor_dBm(B_hz)
+        S_min = N_dBm + self.sp_nf.value() + self.sp_snrreq.value()
+        L_max = self.sp_p_tx.value() + self.sp_g_tx.value() + self.sp_g_rx.value() - self.sp_l_sys.value() - (S_min + self.sp_lbf.value())
+
+        env_main = self.cb_env_main.currentText() or "Город"
+        env_type = self.cb_env_type.currentText() or ("Метрополис" if env_main=="Город" else "Село")
+        if env_main == "Город":
+            city_size = "Крупная" if env_type in ("Метрополис","Большой") else "Малая"
+            env_corr  = "Городская"; metro_flag = (env_type == "Метрополис")
+        else:
+            city_size = "Малая"
+            env_corr  = "Пригород" if env_type == "Гор. типа" else "Открытая"
+            metro_flag = False
+
+        f   = self.sp_f_MHz.value()
+        htx = self.sp_h_tx.value(); hrx = self.sp_h_rx.value()
+        hb, hm = (max(htx, hrx), min(htx, hrx))
+
+        def L_of(d_km):
+            if self.cb_model.currentIndex() == 0:
+                return hata_env_correction(hata_urban_L(f, hb, hm, d_km, city_size), f, env_corr)
+            else:
+                return hata_env_correction(cost231_hata_L(f, hb, hm, d_km, city_size, metro_flag), f, env_corr)
+
+        L0 = L_of(1.0); L1 = L_of(10.0); B = L1 - L0; A = L0
+        d_link = invert_A_B(L_max, A, B)
+        d_hor  = radio_horizon_km(htx, hrx)
+        d_theor = max(0.0, min(d_link, d_hor))
+
+        self.lbl_Lmax.setText(f"{L_max:.2f} дБ")
+        self.lbl_dlink.setText(f"{d_link:.3g} км")
+        self.lbl_dhor.setText(f"{d_hor:.3g} км")
+        self.lbl_dtheor.setText(f"{d_theor:.3g} км")
+
+        self.ax.clear()
+        xmax = max(1.0, d_link, d_hor); x_max_plot = max(10.0, 2.0*xmax)
+        xs = []; x = 0.1
+        while x <= x_max_plot: xs.append(x); x *= 1.12
+        ys = [L_of(xx) for xx in xs]
+        self.ax.plot(xs, ys, label="Потери по модели")
+        if d_link > 0: self.ax.axvline(d_link, linestyle=":",  label=f"d_link = {d_link:.3g} км")
+        if d_hor  > 0: self.ax.axvline(d_hor,  linestyle="-.", label=f"d_horizon = {d_hor:.3g} км")
+        self.ax.axhline(L_max, linestyle="--", label=f"L_max = {L_max:.1f} дБ")
+        if d_hor > 0:
+            L_at_hor = L_of(d_hor); self.ax.axhline(L_at_hor, linestyle="--", label=f"L(d_hor) = {L_at_hor:.1f} дБ")
+
+        if self.chk_logx.isChecked():
+            self.ax.set_xscale("log")
+            self.ax.xaxis.set_major_locator(LogLocator(base=10.0, subs=(1.,2.,5.)))
+        else:
+            self.ax.set_xscale("linear")
+        self.ax.xaxis.set_major_formatter(FuncFormatter(fmt_plain))
+        self.ax.set_xlabel("Расстояние, км"); self.ax.set_ylabel("Потери, дБ")
+        self.ax.grid(True, which="both", alpha=0.25); self.ax.legend(loc="best")
+        self.canvas.draw_idle()
+
+        self._last_calc = dict(
+            L_max=L_max, d_link=d_link, d_hor=d_hor, d_theor=d_theor,
+            N_dBm=N_dBm, S_min=S_min, f=f, hb=hb, hm=hm,
+            env_main=env_main, env_type=env_type, model=("Hata" if self.cb_model.currentIndex()==0 else "COST-231"),
+            ptx=self.sp_p_tx.value(), gtx=self.sp_g_tx.value(), grx=self.sp_g_rx.value(),
+            lsys=self.sp_l_sys.value(), nf=self.sp_nf.value(), bw_khz=self.sp_bw_khz.value(),
+            snr=self.sp_snrreq.value(), lbf=self.sp_lbf.value()
+        )
+
+    # ---------- отчёты ----------
+    def render_html_report(self) -> str:
+        c = getattr(self, "_last_calc", {})
+        prof = self.cb_profile.currentText() or "не задан"
+        a_tx = self.cb_ant_tx.currentText() or "не задана"
+        a_rx = self.cb_ant_rx.currentText() or "не задана"
+        return f"""<!doctype html><html><head><meta charset="utf-8"><title>Отчёт</title>
+<style>body{{font-family:system-ui,Segoe UI,Roboto,Arial,sans-serif;}}
+table{{border-collapse:collapse}} td,th{{border:1px solid #ccc;padding:4px 8px}}
+h1,h2{{margin:0.4rem 0}} small{{color:#666}}</style></head><body>
+<h1>Отчёт по линк-бюджету</h1>
+<h2>Профили</h2>
+<table>
+<tr><th>Модем</th><td>{prof}</td></tr>
+<tr><th>Антенна TX</th><td>{a_tx}</td></tr>
+<tr><th>Антенна RX</th><td>{a_rx}</td></tr>
+</table>
+<h2>Среда / Рельеф</h2>
+<table><tr><th>Среда</th><td>{c.get('env_main','')}</td><th>Тип</th><td>{c.get('env_type','')}</td></tr></table>
+<h2>Входные параметры</h2>
+<table>
+<tr><th>P_tx</th><td>{c.get('ptx','')}</td><th>G_tx</th><td>{c.get('gtx','')}</td><th>G_rx</th><td>{c.get('grx','')}</td></tr>
+<tr><th>L_sys</th><td>{c.get('lsys','')}</td><th>NF</th><td>{c.get('nf','')}</td><th>Полоса B (кГц)</th><td>{c.get('bw_khz','')}</td></tr>
+<tr><th>Req SNR</th><td>{c.get('snr','')}</td><th>Lbf</th><td>{c.get('lbf','')}</td><th>—</th><td>—</td></tr>
+<tr><th>f (МГц)</th><td>{c.get('f','')}</td><th>h_b (м)</th><td>{c.get('hb','')}</td><th>h_m (м)</th><td>{c.get('hm','')}</td></tr>
+<tr><th>Модель</th><td>{c.get('model','')}</td><th>—</th><td>—</td><th>—</th><td>—</td></tr>
+</table>
+<h2>Результаты</h2>
+<table>
+<tr><th>L_max (дБ)</th><td>{c.get('L_max','')}</td></tr>
+<tr><th>d_link (км)</th><td>{c.get('d_link','')}</td></tr>
+<tr><th>d_horizon (км)</th><td>{c.get('d_hor','')}</td></tr>
+<tr><th>Теоретическая дальность</th><td><b>{c.get('d_theor','')}</b></td></tr>
+</table>
+<p><small>Версия ПО: v1.2.3</small></p>
+</body></html>"""
+
+    def export_html_dialog(self):
+        fn, _ = QtWidgets.QFileDialog.getSaveFileName(self, "Экспорт HTML", "report.html", "HTML (*.html)")
+        if not fn: return
+        with open(fn, "w", encoding="utf-8") as f: f.write(self.render_html_report())
+        QtWidgets.QMessageBox.information(self, "Готово", f"HTML сохранён:\n{fn}")
+
+    def export_pdf_dialog(self):
+        fn, _ = QtWidgets.QFileDialog.getSaveFileName(self, "Экспорт PDF", "report.pdf", "PDF (*.pdf)")
+        if not fn: return
+        html = self.render_html_report()
+        doc = QtGui.QTextDocument(); doc.setHtml(html)
+        printer = QPrinter(QPrinter.PrinterMode.HighResolution)
+        printer.setOutputFormat(QPrinter.OutputFormat.PdfFormat)
+        try: printer.setPageSize(QtGui.QPageSize(QtGui.QPageSize.PageSizeId.A4))
+        except Exception: pass
+        printer.setOutputFileName(fn); doc.print(printer)
+        QtWidgets.QMessageBox.information(self, "Готово", f"PDF сохранён:\n{fn}")
+
+    # ---------- проект ----------
+    def save_project_to_file(self, fn: str):
+        data = {
+            "schema": "1.0",
+            "profile": self.cb_profile.currentText(),
+            "ant_tx": self.cb_ant_tx.currentText(),
+            "ant_rx": self.cb_ant_rx.currentText(),
+            "calc": {
+                "P_tx": self.sp_p_tx.value(), "G_tx": self.sp_g_tx.value(), "G_rx": self.sp_g_rx.value(),
+                "L_sys": self.sp_l_sys.value(), "NF": self.sp_nf.value(), "B_kHz": self.sp_bw_khz.value(),
+                "SNR_req": self.sp_snrreq.value(), "Lbf": self.sp_lbf.value(),
+                "f_MHz": self.sp_f_MHz.value(), "h_tx": self.sp_h_tx.value(), "h_rx": self.sp_h_rx.value(),
+                "env_main": self.cb_env_main.currentText(), "env_type": self.cb_env_type.currentText(),
+                "model": self.cb_model.currentIndex()
+            }
+        }
+        with open(fn, "w", encoding="utf-8") as f: json.dump(data, f, ensure_ascii=False, indent=2)
+
+    def load_project_from_file(self, fn: str):
+        with open(fn, "r", encoding="utf-8") as f: data = json.load(f)
+        self.cb_profile.setEditable(True); self.cb_profile.setEditText(data.get("profile","") or "")
+        self.cb_ant_tx.setEditable(True);  self.cb_ant_tx.setEditText(data.get("ant_tx","") or "")
+        self.cb_ant_rx.setEditable(True);  self.cb_ant_rx.setEditText(data.get("ant_rx","") or "")
+        c = data.get("calc", {})
+        self.sp_p_tx.setValue(c.get("P_tx", self.sp_p_tx.value()))
+        self.sp_g_tx.setValue(c.get("G_tx", self.sp_g_tx.value())); self.sp_g_rx.setValue(c.get("G_rx", self.sp_g_rx.value()))
+        self.sp_l_sys.setValue(c.get("L_sys", self.sp_l_sys.value())); self.sp_nf.setValue(c.get("NF", self.sp_nf.value()))
+        self.sp_bw_khz.setValue(c.get("B_kHz", self.sp_bw_khz.value())); self.sp_snrreq.setValue(c.get("SNR_req", self.sp_snrreq.value()))
+        self.sp_lbf.setValue(c.get("Lbf", self.sp_lbf.value()))
+        self.sp_f_MHz.setValue(c.get("f_MHz", self.sp_f_MHz.value()))
+        self.sp_h_tx.setValue(c.get("h_tx", self.sp_h_tx.value())); self.sp_h_rx.setValue(c.get("h_rx", self.sp_h_rx.value()))
+        self.cb_env_main.setCurrentText(c.get("env_main", self.cb_env_main.currentText())); self._update_env_type()
+        self.cb_env_type.setCurrentText(c.get("env_type", self.cb_env_type.currentText()))
+        self.cb_model.setCurrentIndex(c.get("model", self.cb_model.currentIndex()))
+        self.recompute()
+
+    # ---------- профили JSON + автосохранение выбора ----------
+    def _settings(self):
+        st = QtCore.QSettings(ORG, APP)
+        st.setFallbacksEnabled(True)
+        return st
+
+    def _save_last_profiles(self):
+        st = self._settings()
+        st.setValue("last_modem_text", self.cb_profile.currentText())
+        st.setValue("last_ant_tx_text", self.cb_ant_tx.currentText())
+        st.setValue("last_ant_rx_text", self.cb_ant_rx.currentText())
+
+    def _restore_last_profiles(self):
+        st = self._settings()
+        # авто-загрузка последнего JSON, если он известен и существует
+        last_file = st.value("last_profiles_file", "", str)
+        if last_file and os.path.exists(last_file):
+            try:
+                with open(last_file, "r", encoding="utf-8") as f: data = json.load(f)
+                modems = [m.get("name","").strip() for m in data.get("modems", []) if m.get("name")]
+                ants   = [a.get("name","").strip() for a in data.get("antennas", []) if a.get("name")]
+                if modems: self.cb_profile.clear(); self.cb_profile.addItems(modems)
+                if ants:
+                    self.cb_ant_tx.clear(); self.cb_ant_tx.addItems(ants)
+                    self.cb_ant_rx.clear(); self.cb_ant_rx.addItems(ants)
+            except Exception:
+                pass
+        # восстановить строки (не заставляя авто-селект)
+        self.cb_profile.setEditable(True); self.cb_profile.setEditText(st.value("last_modem_text","",str))
+        self.cb_ant_tx.setEditable(True);  self.cb_ant_tx.setEditText(st.value("last_ant_tx_text","",str))
+        self.cb_ant_rx.setEditable(True);  self.cb_ant_rx.setEditText(st.value("last_ant_rx_text","",str))
+        # автосохранение изменений
+        self.cb_profile.currentTextChanged.connect(self._save_last_profiles)
+        self.cb_ant_tx.currentTextChanged.connect(self._save_last_profiles)
+        self.cb_ant_rx.currentTextChanged.connect(self._save_last_profiles)
+
+    def on_load_profiles_clicked(self):
+        fn, _ = QtWidgets.QFileDialog.getOpenFileName(self, "Загрузить профили (JSON)", "", "JSON (*.json)")
+        if not fn: return
+        try:
+            with open(fn, "r", encoding="utf-8") as f: data = json.load(f)
+        except Exception as e:
+            QtWidgets.QMessageBox.warning(self, "Ошибка", f"Не удалось прочитать JSON:\n{e}")
+            return
+        modems = [m.get("name","").strip() for m in data.get("modems", []) if m.get("name")]
+        ants   = [a.get("name","").strip() for a in data.get("antennas", []) if a.get("name")]
+        if modems: self.cb_profile.clear(); self.cb_profile.addItems(modems); self.cb_profile.setEditable(True)
+        if ants:
+            self.cb_ant_tx.clear(); self.cb_ant_tx.addItems(ants); self.cb_ant_tx.setEditable(True)
+            self.cb_ant_rx.clear(); self.cb_ant_rx.addItems(ants); self.cb_ant_rx.setEditable(True)
+        # запомнить выбранный файл
+        st = self._settings(); st.setValue("last_profiles_file", fn)
+        QtWidgets.QMessageBox.information(self, "Готово", "Профили загружены.")
+
+
+    def _apply_width_policy(self):
+        # Топ-3: одинаковая ширина по самой широкой +30%   self.cb_profile, 
+        try:
+            top3 = [self.cb_ant_tx, self.cb_ant_rx]
+            maxw = max(w.sizeHint().width() for w in top3)
+            w30 = int(maxw * 1.50)
+            for w in top3:
+                w.setMinimumWidth(w30)
+                w.setMaximumWidth(w30)
+        except Exception:
+            pass
+        # Остальные: +25% от sizeHint
+        try:
+            for name, w in vars(self).items():
+                if name.startswith(("sp_", "cb_")) and w not in (self.cb_profile, self.cb_ant_tx, self.cb_ant_rx):
+                    if hasattr(w, "sizeHint"):
+                        wh = w.sizeHint().width()
+                        w.setMinimumWidth(int(wh * 1.30))
+                        w.setMaximumWidth(int(wh * 1.30))
+        except Exception:
+            pass
+
+
+# --- [AUTO] profiles_title_widths_patch ---
+try:
+    from PySide6 import QtWidgets, QtCore
+except Exception:
+    QtWidgets = None
+    QtCore = None
+
+def _form_rows_map(form):
+    rows = {}
+    try:
+        for i in range(form.rowCount()):
+            li = form.itemAt(i, QtWidgets.QFormLayout.LabelRole)
+            fi = form.itemAt(i, QtWidgets.QFormLayout.FieldRole)
+            lbl = None
+            if li is not None and li.widget() is not None:
+                try:
+                    lbl = li.widget().text().strip()
+                except Exception:
+                    lbl = None
+            if lbl is None:
+                continue
+            w = fi.widget() if fi is not None else None
+            rows[lbl] = (i, w)
+    except Exception:
+        pass
+    return rows
+
+def _find_row_idx(form, candidates):
+    rows = _form_rows_map(form)
+    for c in candidates:
+        if c in rows:
+            return rows[c][0]
+    return None
+
+def _get_field(form, label):
+    rows = _form_rows_map(form)
+    return rows.get(label, (None, None))[1]
+
+def _apply_profiles_title_and_widths(self):
+    if QtWidgets is None:
+        return
+    # Найти главную форму
+    form = None
+    try:
+        for lay in self.findChildren(QtWidgets.QFormLayout):
+            form = lay
+            break
+    except Exception:
+        form = None
+    if form is None:
+        return
+
+    # 1) Заголовок "Профили:" над строкой "Модем"/"Модем/Профиль"
+    try:
+        idx = _find_row_idx(form, ["Модем", "Модем/Профиль"])
+        if idx is not None:
+            li = form.itemAt(max(0, idx-1), QtWidgets.QFormLayout.LabelRole)
+            already = bool(li and li.widget() and li.widget().text().strip() == "Профили:")
+            if not already:
+                form.insertRow(idx, QtWidgets.QLabel("Профили:"))
+    except Exception:
+        pass
+
+    # 2) Сузить на ~50%: "Модем", "Антенна TX", "Антенна RX"
+    for lab in ("Модем", "Антенна TX", "Антенна RX"):
+        try:
+            w = _get_field(form, lab)
+            if w and hasattr(w, "sizeHint"):
+                ww = max(60, int(w.sizeHint().width() * 0.50))
+                w.setMinimumWidth(ww); w.setMaximumWidth(ww)
+        except Exception:
+            pass
+
+    # 3) Кнопка "Загрузить профили..." - тоже ~50%
+    try:
+        for btn in self.findChildren(QtWidgets.QPushButton):
+            t = ""
+            try: t = btn.text()
+            except Exception: pass
+            if "Загрузить профили" in t:
+                ww = max(80, int(btn.sizeHint().width() * 0.50))
+                btn.setMinimumWidth(ww); btn.setMaximumWidth(ww)
+    except Exception:
+        pass
+
+    # 4) "Среда" такой же ширины как "Тип"
+    base_w = None
+    try:
+        w_type = _get_field(form, "Тип")
+        if w_type and hasattr(w_type, "sizeHint"):
+            base_w = w_type.sizeHint().width()
+        w_env = _get_field(form, "Среда")
+        if base_w and w_env and hasattr(w_env, "sizeHint"):
+            w_env.setMinimumWidth(base_w); w_env.setMaximumWidth(base_w)
+    except Exception:
+        pass
+
+    # 5) Остальные поля — как у "Среда/Тип"
+    if base_w is None:
+        try:
+            w_env = _get_field(form, "Среда")
+            if w_env and hasattr(w_env, "sizeHint"):
+                base_w = w_env.sizeHint().width()
+        except Exception:
+            pass
+
+    if base_w:
+        labels = [
+            "P_tx","G_tx","G_rx","L_sys","NF","Полоса В","Треб. SNR","Запас Lbf",
+            "Модель","f","h_TX","h_RX","L_max (дБ)","d_link (км)","d_horizon (км)","Теоретическая дальность (км)"
+        ]
+        for lab in labels:
+            try:
+                w = _get_field(form, lab)
+                if w and hasattr(w, "sizeHint"):
+                    w.setMinimumWidth(base_w); w.setMaximumWidth(base_w)
+            except Exception:
+                pass
+
+def _install_profiles_patch():
+    try:
+        # LinkBudgetTab определён в этом модуле
+        LinkBudgetTab
+    except NameError:
+        return
+    try:
+        orig_init = LinkBudgetTab.__init__
+    except Exception:
+        return
+    def wrapped(self, *a, **kw):
+        orig_init(self, *a, **kw)
+        try:
+            QtCore.QTimer.singleShot(0, lambda: _apply_profiles_title_and_widths(self))
+        except Exception:
+            pass
+    LinkBudgetTab.__init__ = wrapped
+
+try:
+    _install_profiles_patch()
+except Exception:
+    pass
+# --- [/AUTO] profiles_title_widths_patch ---
+
+
+# --- [AUTO] profiles_finetune_v2 ---
+try:
+    from PySide6 import QtWidgets, QtCore
+except Exception:
+    QtWidgets = None
+    QtCore = None
+
+def _pf_rows(form):
+    rows = []
+    try:
+        for i in range(form.rowCount()):
+            li = form.itemAt(i, QtWidgets.QFormLayout.LabelRole)
+            fi = form.itemAt(i, QtWidgets.QFormLayout.FieldRole)
+            lblw = li.widget() if li is not None else None
+            fldw = fi.widget() if fi is not None else None
+            lbl  = ""
+            try:
+                if lblw: lbl = lblw.text().strip()
+            except Exception:
+                lbl = ""
+            rows.append((i, lblw, fldw, lbl))
+    except Exception:
+        pass
+    return rows
+
+def _pf_get_field(form, *label_names):
+    for i, lblw, fldw, lbl in _pf_rows(form):
+        if lbl in label_names:
+            return fldw
+    return None
+
+def _pf_get_labelwidget(form, *label_names):
+    for i, lblw, fldw, lbl in _pf_rows(form):
+        if lbl in label_names:
+            return lblw
+    return None
+
+def _pf_first_form(widget):
+    try:
+        return widget.findChildren(QtWidgets.QFormLayout)[0]
+    except Exception:
+        return None
+
+def _pf_apply_finetune(self):
+    if QtWidgets is None:
+        return
+    form = _pf_first_form(self)
+    if form is None:
+        return
+
+    # 1) Убрать скобки у f / h_TX / h_RX (только у них)
+    try:
+        for i, lblw, fldw, lbl in _pf_rows(form):
+            if not lblw: 
+                continue
+            if lbl.startswith("f") and lbl.split("(")[0].strip() == "f" and "(" in lbl:
+                lblw.setText("f")
+            if lbl.startswith("h_TX") and lbl.split("(")[0].strip() == "h_TX" and "(" in lbl:
+                lblw.setText("h_TX")
+            if lbl.startswith("h_RX") and lbl.split("(")[0].strip() == "h_RX" and "(" in lbl:
+                lblw.setText("h_RX")
+    except Exception:
+        pass
+
+    # 2) Модем шириной как Антенна TX
+    try:
+        w_ant_tx = _pf_get_field(form, "Антенна TX")
+        w_modem  = _pf_get_field(form, "Модем", "Модем/Профиль")
+        if w_ant_tx and w_modem and hasattr(w_ant_tx, "sizeHint"):
+            base = max(60, w_ant_tx.sizeHint().width())
+            w_modem.setMinimumWidth(base); w_modem.setMaximumWidth(base)
+    except Exception:
+        pass
+
+    # 3) Среда шириной как Тип
+    try:
+        w_type = _pf_get_field(form, "Тип")
+        w_env  = _pf_get_field(form, "Среда")
+        if w_type and w_env and hasattr(w_type, "sizeHint"):
+            base = max(60, w_type.sizeHint().width())
+            w_env.setMinimumWidth(base); w_env.setMaximumWidth(base)
+    except Exception:
+        pass
+
+    # 4) "Полоса В" шириной как "NF"
+    try:
+        w_nf = _pf_get_field(form, "NF")
+        w_bw = _pf_get_field(form, "Полоса В")
+        if w_nf and w_bw and hasattr(w_nf, "sizeHint"):
+            base = max(60, w_nf.sizeHint().width())
+            w_bw.setMinimumWidth(base); w_bw.setMaximumWidth(base)
+    except Exception:
+        pass
+
+    # 5) "Модель" и "f" шириной как "h_TX"
+    try:
+        # после п.1 метки для h_TX уже без скобок
+        w_h_tx = _pf_get_field(form, "h_TX", "h_TX (м)", "h_TX (m)")
+        if w_h_tx and hasattr(w_h_tx, "sizeHint"):
+            base = max(60, w_h_tx.sizeHint().width())
+            for lab in ("Модель", "f", "f (МГц)", "f (MHz)"):
+                w = _pf_get_field(form, lab)
+                if w:
+                    w.setMinimumWidth(base); w.setMaximumWidth(base)
+    except Exception:
+        pass
+
+def _pf_install_finetune():
+    try:
+        LinkBudgetTab
+    except NameError:
+        return
+    orig_init = getattr(LinkBudgetTab, "__init__", None)
+    if not callable(orig_init):
+        return
+    def wrapped(self, *a, **kw):
+        orig_init(self, *a, **kw)
+        # запускаем после прочих отложенных правок — чуть позже
+        try:
+            QtCore.QTimer.singleShot(80, lambda: _pf_apply_finetune(self))
+        except Exception:
+            pass
+    LinkBudgetTab.__init__ = wrapped
+
+try:
+    _pf_install_finetune()
+except Exception:
+    pass
+# --- [/AUTO] profiles_finetune_v2 ---
+
+
+# --- [AUTO] profiles_finetune_v3 ---
+try:
+    from PySide6 import QtWidgets, QtCore, QtGui
+except Exception:
+    QtWidgets = None
+    QtCore = None
+    QtGui = None
+
+def _pf_rows(form):
+    rows = []
+    try:
+        for i in range(form.rowCount()):
+            li = form.itemAt(i, QtWidgets.QFormLayout.LabelRole)
+            fi = form.itemAt(i, QtWidgets.QFormLayout.FieldRole)
+            lblw = li.widget() if li is not None else None
+            fldw = fi.widget() if fi is not None else None
+            lbl  = ""
+            try:
+                if lblw: lbl = lblw.text().strip()
+            except Exception:
+                lbl = ""
+            rows.append((i, lblw, fldw, lbl))
+    except Exception:
+        pass
+    return rows
+
+def _pf_get_field(form, *label_names):
+    for i, lblw, fldw, lbl in _pf_rows(form):
+        if lbl in label_names:
+            return fldw
+    return None
+
+def _pf_first_form(widget):
+    try:
+        return widget.findChildren(QtWidgets.QFormLayout)[0]
+    except Exception:
+        return None
+
+def _to_float2(s: str):
+    try:
+        return float(s.replace(',', '.'))
+    except Exception:
+        return None
+
+def _apply_two_decimals(widget):
+    # QDoubleSpinBox
+    if hasattr(widget, "setDecimals"):
+        try:
+            widget.setDecimals(2)
+            # отключим «дёрганье» при вводе и зафиксируем отображение .2f
+            if hasattr(widget, "setKeyboardTracking"):
+                widget.setKeyboardTracking(False)
+        except Exception:
+            pass
+        return
+    # QLineEdit
+    if QtGui and isinstance(widget, QtWidgets.QLineEdit):
+        try:
+            val = QtGui.QDoubleValidator()
+            val.setNotation(QtGui.QDoubleValidator.StandardNotation)
+            # ограничение по точности эмулируем форматированием
+            widget.setValidator(val)
+            def _fmt():
+                v = _to_float2(widget.text())
+                if v is not None:
+                    widget.setText(f"{v:.2f}")
+            widget.editingFinished.connect(_fmt)
+        except Exception:
+            pass
+
+def _pf_apply_v3(self):
+    if QtWidgets is None:
+        return
+    form = _pf_first_form(self)
+    if form is None:
+        return
+
+    # 1) decimals=2 для h_TX, h_RX, f
+    for lab in ("h_TX", "h_TX (м)", "h_TX (m)"):
+        w = _pf_get_field(form, lab)
+        if w: _apply_two_decimals(w)
+    for lab in ("h_RX", "h_RX (м)", "h_RX (m)"):
+        w = _pf_get_field(form, lab)
+        if w: _apply_two_decimals(w)
+    for lab in ("f", "f (МГц)", "f (MHz)"):
+        w = _pf_get_field(form, lab)
+        if w: _apply_two_decimals(w)
+
+    # 2) Ширины: Антенна TX/RX = ширине Модем
+    modem = _pf_get_field(form, "Модем", "Модем/Профиль")
+    ant_tx = _pf_get_field(form, "Антенна TX")
+    ant_rx = _pf_get_field(form, "Антенна RX")
+    try:
+        if modem and hasattr(modem, "sizeHint"):
+            base = max(60, modem.sizeHint().width())
+            for w in (ant_tx, ant_rx):
+                if w:
+                    w.setMinimumWidth(base); w.setMaximumWidth(base)
+    except Exception:
+        pass
+
+def _pf_install_v3():
+    try:
+        LinkBudgetTab
+    except NameError:
+        return
+    orig_init = getattr(LinkBudgetTab, "__init__", None)
+    if not callable(orig_init):
+        return
+    def wrapped(self, *a, **kw):
+        orig_init(self, *a, **kw)
+        # запустить после прочих отложенных правок
+        try:
+            QtCore.QTimer.singleShot(120, lambda: _pf_apply_v3(self))
+        except Exception:
+            pass
+    LinkBudgetTab.__init__ = wrapped
+
+try:
+    _pf_install_v3()
+except Exception:
+    pass
+# --- [/AUTO] profiles_finetune_v3 ---
+
